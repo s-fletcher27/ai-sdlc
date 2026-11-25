@@ -1,0 +1,27 @@
+# Copy to <target-repo>/.github/ISSUE_TEMPLATE/feature_request.yml
+# Issues created from this form get `status:new-feature`, which starts the PM agent
+# (only when the author is an OWNER / MEMBER / COLLABORATOR of the repo).
+name: "Feature (AI-SDLC)"
+description: "Raise a feature for the AI-SDLC pipeline to break down, design and build"
+title: "[Feature]: "
+labels: ["status:new-feature"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should users be able to do, and why?
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Desired behaviour
+      description: Key scenarios, inputs/outputs, examples.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints / out of scope
+      description: Anything the agents must respect or avoid (optional).

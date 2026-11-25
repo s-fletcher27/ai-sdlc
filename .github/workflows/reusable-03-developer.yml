@@ -1,0 +1,377 @@
+name: "AI-SDLC 03 · Developer (one PR per story)"
+
+# Called from a target repo on:
+#   - issues.labeled `status:design-approved`        → build next unmerged story (Story 1 first)
+#   - issue_comment `/refine ...` on a story PR       → refine that story's branch
+#   - pull_request.closed (merged) of a story PR      → build Story K+1, or mark feature complete
+#
+# Branches:  ai/issue-<N>              design doc (from Architect)
+#            feat/issue-<N>-story-<K>  one branch + Draft PR per story
+# Story 1 branches from ai/issue-<N> (so its PR carries the design to the default branch);
+# Story K>1 branches from the default branch after Story K-1 is merged.
+
+on:
+  workflow_call:
+    inputs:
+      container_image:
+        description: "Image the agent and tests run in (Debian/Ubuntu-based; needs apt-get)"
+        type: string
+        default: "ubuntu:24.04"
+      setup_command:
+        description: "Optional command run before the agent (e.g. install deps)"
+        type: string
+        default: ""
+      test_command:
+        type: string
+        default: "echo 'No test command configured'"
+      max_turns:
+        type: number
+        default: 40
+      ai_sdlc_repo:
+        type: string
+        default: "s-fletcher27/ai-sdlc"
+      ai_sdlc_ref:
+        type: string
+        default: "main"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      run: ${{ steps.resolve.outputs.run }}
+      mode: ${{ steps.resolve.outputs.mode }}
+      issue: ${{ steps.resolve.outputs.issue }}
+      story: ${{ steps.resolve.outputs.story }}
+      story_title: ${{ steps.resolve.outputs.story_title }}
+      is_last: ${{ steps.resolve.outputs.is_last }}
+      branch: ${{ steps.resolve.outputs.branch }}
+      base: ${{ steps.resolve.outputs.base }}
+      pr: ${{ steps.resolve.outputs.pr }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_ISSUE: ${{ github.event.issue.number }}
+      PR_MERGED: ${{ github.event.pull_request.merged }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Resolve issue, story and branches
+        id: resolve
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          skip() { echo "$1"; out run false; exit 0; }
+          mode=build; pr=""
+
+          case "$EVENT_NAME" in
+            issues)
+              issue="$EVENT_ISSUE"
+              merged=$(gh pr list -R "$repo" --state merged --limit 200 --json headRefName \
+                --jq "[.[] | select(.headRefName | test(\"^feat/issue-${issue}-story-[0-9]+\$\"))] | length")
+              story=$((merged + 1))
+              ;;
+            issue_comment)
+              pr="$EVENT_ISSUE"
+              head=$(gh pr view "$pr" -R "$repo" --json headRefName,state \
+                --jq 'if .state == "OPEN" then .headRefName else "" end')
+              [[ "$head" =~ ^feat/issue-([0-9]+)-story-([0-9]+)$ ]] || skip "PR #$pr is not an open ai-sdlc story PR; skipping."
+              issue="${BASH_REMATCH[1]}"; story="${BASH_REMATCH[2]}"; mode=refine
+              ;;
+            pull_request)
+              [ "$PR_MERGED" = "true" ] || skip "PR closed without merge; nothing to do."
+              [[ "$PR_HEAD_REF" =~ ^feat/issue-([0-9]+)-story-([0-9]+)$ ]] || skip "Not an ai-sdlc story branch; skipping."
+              issue="${BASH_REMATCH[1]}"; story=$(( BASH_REMATCH[2] + 1 ))
+              ;;
+            *) skip "Unsupported event $EVENT_NAME" ;;
+          esac
+
+          branch="feat/issue-${issue}-story-${story}"
+          if [ "$mode" = "refine" ]; then base="$branch"
+          elif [ "$story" = "1" ]; then base="ai/issue-${issue}"
+          else base="$DEFAULT_BRANCH"; fi
+
+          design_path="docs/designs/issue-${issue}.md"
+          if ! gh api "repos/$repo/contents/$design_path?ref=$base" -H "Accept: application/vnd.github.raw" > design.md; then
+            echo "::error::Could not read $design_path on $base"; exit 1
+          fi
+
+          heading_re() { echo "^### Story $1([:. ]|\$)"; }
+          if ! grep -Eq "$(heading_re "$story")" design.md; then
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              gh issue comment "$issue" -R "$repo" --body "✅ All stories for #$issue are merged. AI-SDLC pipeline complete."
+              gh issue edit "$issue" -R "$repo" --remove-label "gate:pr-review" || true
+              skip "Feature complete."
+            fi
+            echo "::error::$design_path has no '### Story $story' section"; exit 1
+          fi
+          title=$(grep -E "$(heading_re "$story")" design.md | head -1 | sed -E 's/^### Story [0-9]+[:. ]*//')
+          if grep -Eq "$(heading_re $((story + 1)))" design.md; then is_last=false; else is_last=true; fi
+
+          out run true; out mode "$mode"; out issue "$issue"; out story "$story"
+          out story_title "${title:-Story $story}"; out is_last "$is_last"
+          out branch "$branch"; out base "$base"; out pr "$pr"
+          echo "Resolved: mode=$mode issue=#$issue story=$story branch=$branch base=$base last=$is_last"
+
+      - name: Lock issue and consume Gate 2 labels
+        if: steps.resolve.outputs.run == 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.resolve.outputs.issue }}
+        run: |
+          gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --add-label "agent:working"
+          if [ "$EVENT_NAME" = "issues" ]; then
+            gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "status:design-approved" || true
+            gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "gate:design-review" || true
+          fi
+
+      - name: Checkout ai-sdlc framework
+        if: steps.resolve.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ai_sdlc_repo }}
+          ref: ${{ inputs.ai_sdlc_ref }}
+          path: ai-sdlc-framework
+
+      - name: Build context
+        if: steps.resolve.outputs.run == 'true'
+        run: |
+          mkdir -p ai-sdlc-context
+          bash ai-sdlc-framework/scripts/context.sh \
+            "${{ steps.resolve.outputs.issue }}" "${{ steps.resolve.outputs.pr }}" > ai-sdlc-context/context.md
+
+      - name: Upload context
+        if: steps.resolve.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-sdlc-context
+          path: ai-sdlc-context/context.md
+
+  # ---------------------------------------------------------------------------
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ${{ inputs.container_image }}
+    permissions:
+      contents: write
+    outputs:
+      tests_passed: ${{ steps.test.outputs.passed }}
+    env:
+      ISSUE_NUMBER: ${{ needs.resolve.outputs.issue }}
+      STORY_NUMBER: ${{ needs.resolve.outputs.story }}
+      STORY_TITLE: ${{ needs.resolve.outputs.story_title }}
+      MODE: ${{ needs.resolve.outputs.mode }}
+      BRANCH: ${{ needs.resolve.outputs.branch }}
+      BASE: ${{ needs.resolve.outputs.base }}
+      TEST_COMMAND: ${{ inputs.test_command }}
+      SETUP_COMMAND: ${{ inputs.setup_command }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install base tools
+        shell: sh
+        run: |
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::container_image must be Debian/Ubuntu-based (apt-get not found)"; exit 1
+          fi
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git curl ca-certificates bash
+          git config --global --add safe.directory '*'
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false   # agent never sees a push token
+
+      - name: Checkout ai-sdlc framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ai_sdlc_repo }}
+          ref: ${{ inputs.ai_sdlc_ref }}
+          path: .ai-sdlc-framework
+          persist-credentials: false
+
+      - name: Download context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-sdlc-context
+          path: .ai-sdlc-out
+
+      - name: Prepare story branch
+        run: |
+          mv .ai-sdlc-framework "$RUNNER_TEMP/ai-sdlc"
+          echo ".ai-sdlc-out/" >> .git/info/exclude
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            echo "REMOTE_EXISTS=true" >> "$GITHUB_ENV"
+          else
+            git checkout -b "$BRANCH" "origin/$BASE"
+            echo "REMOTE_EXISTS=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Project setup
+        if: inputs.setup_command != ''
+        run: bash -c "$SETUP_COMMAND"
+
+      - name: Build prompt
+        env:
+          REFINE_FEEDBACK: ${{ github.event.comment.body }}
+        run: |
+          bash "$RUNNER_TEMP/ai-sdlc/scripts/render-prompt.sh" \
+            "$RUNNER_TEMP/ai-sdlc/prompts/developer.md" .ai-sdlc-out/context.md > .ai-sdlc-out/prompt.md
+
+      - name: Install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run Developer agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+        run: |
+          claude -p --max-turns "$MAX_TURNS" \
+            --allowedTools "Read,Glob,Grep,Write,Edit,MultiEdit,Bash" \
+            < .ai-sdlc-out/prompt.md || echo "::warning::claude exited non-zero (possibly max turns reached)"
+
+      - name: Guardrail — discard workflow edits
+        run: |
+          if [ -n "$(git status --porcelain -uall -- .github/workflows)" ]; then
+            echo "::warning::Agent modified .github/workflows; discarding those changes"
+            git checkout HEAD -- .github/workflows 2>/dev/null || true
+            git clean -fdq -- .github/workflows
+          fi
+
+      - name: Run test suite (independent of the agent)
+        id: test
+        run: |
+          set +e
+          bash -c "$TEST_COMMAND" 2>&1 | tee .ai-sdlc-out/test.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -eq 0 ]; then echo "passed=true" >> "$GITHUB_OUTPUT"; else echo "passed=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Commit and push story branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTS_PASSED: ${{ steps.test.outputs.passed }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            if [ "$REMOTE_EXISTS" = "true" ]; then
+              echo "::warning::Agent made no new changes; nothing to push."; exit 0
+            fi
+            echo "::error::Agent made no changes for Story $STORY_NUMBER"; exit 1
+          fi
+          prefix=""; [ "$TESTS_PASSED" = "true" ] || prefix="WIP: "
+          git commit -m "${prefix}feat(#$ISSUE_NUMBER): story $STORY_NUMBER — $STORY_TITLE ($MODE)"
+          git push "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
+
+      - name: Upload build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-sdlc-build
+          include-hidden-files: true
+          if-no-files-found: ignore
+          path: |
+            .ai-sdlc-out/pr_body.md
+            .ai-sdlc-out/test.log
+
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [resolve, build]
+    if: always() && needs.resolve.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      TESTS_PASSED: ${{ needs.build.outputs.tests_passed }}
+      ISSUE_NUMBER: ${{ needs.resolve.outputs.issue }}
+      STORY_NUMBER: ${{ needs.resolve.outputs.story }}
+      STORY_TITLE: ${{ needs.resolve.outputs.story_title }}
+      IS_LAST: ${{ needs.resolve.outputs.is_last }}
+      MODE: ${{ needs.resolve.outputs.mode }}
+      BRANCH: ${{ needs.resolve.outputs.branch }}
+      PR_FROM_EVENT: ${{ needs.resolve.outputs.pr }}
+      TEST_COMMAND: ${{ inputs.test_command }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Download build outputs
+        if: needs.build.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-sdlc-build
+          path: out
+
+      - name: Open or update Draft PR and open Gate 3
+        if: needs.build.result == 'success'
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          if [ "$TESTS_PASSED" = "true" ]; then status="✅ passed"; else status="❌ failed (commit marked WIP)"; fi
+          if [ "$IS_LAST" = "true" ]; then link="Closes #$ISSUE_NUMBER"; else link="Part of #$ISSUE_NUMBER"; fi
+          {
+            echo "$link"
+            echo
+            echo "> 🤖 AI-SDLC — Story $STORY_NUMBER of #$ISSUE_NUMBER: **$STORY_TITLE**"
+            echo
+            if [ -s out/pr_body.md ]; then cat out/pr_body.md; else echo "_The agent did not write a PR description._"; fi
+            echo
+            echo "## Automated test run"
+            echo "\`$TEST_COMMAND\` → **$status** ([run]($RUN_URL))"
+            echo
+            echo "<details><summary>Test output (last 100 lines)</summary>"
+            echo
+            echo '```'
+            tail -n 100 out/test.log 2>/dev/null || echo "(no test log)"
+            echo '```'
+            echo "</details>"
+          } > body.md
+
+          pr=$(gh pr list -R "$repo" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            url=$(gh pr create -R "$repo" --draft --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+              --title "[#$ISSUE_NUMBER · Story $STORY_NUMBER] $STORY_TITLE" --body-file body.md)
+            pr="${url##*/}"
+            gh issue comment "$ISSUE_NUMBER" -R "$repo" --body \
+              "🚀 Story $STORY_NUMBER ready for review in #$pr. Human Gate 3: comment \`/refine <feedback>\` on the PR, or mark it ready and **merge** to approve (merging starts the next story)."
+          else
+            [ "$MODE" = "build" ] && gh pr edit "$pr" -R "$repo" --body-file body.md
+            gh pr comment "$pr" -R "$repo" --body "🔁 Developer agent pushed an update ($MODE). Tests: $status. [Run]($RUN_URL)"
+          fi
+          gh pr edit "$pr" -R "$repo" --add-label "gate:pr-review"
+          gh issue edit "$ISSUE_NUMBER" -R "$repo" --add-label "gate:pr-review"
+
+      - name: Report failure
+        if: needs.build.result != 'success' || failure()
+        run: |
+          # shellcheck disable=SC2016  # backticks are literal Markdown
+          if [ "$MODE" = "refine" ]; then retry='comment `/refine ...` on the PR again'; else retry='re-apply the `status:design-approved` label on the issue'; fi
+          msg="⚠️ Developer agent failed for Story $STORY_NUMBER (build: $BUILD_RESULT, [logs]($RUN_URL)). To retry, $retry."
+          gh issue comment "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --body "$msg"
+          if [ -n "$PR_FROM_EVENT" ]; then gh pr comment "$PR_FROM_EVENT" -R "$GITHUB_REPOSITORY" --body "$msg"; fi
+
+      - name: Unlock issue
+        if: always()
+        run: gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "agent:working" || true

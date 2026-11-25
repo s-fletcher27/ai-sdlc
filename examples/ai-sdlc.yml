@@ -1,0 +1,79 @@
+# Copy to <target-repo>/.github/workflows/ai-sdlc.yml
+# Routes GitHub events to the ai-sdlc reusable workflows.
+#
+# Guardrails:
+#  - Stages trigger on the label being *added* (github.event.label.name), not merely present.
+#  - Label/branch changes made by the workflows use GITHUB_TOKEN, which never re-triggers workflows.
+#  - /refine only from OWNER / MEMBER / COLLABORATOR; new features only from trusted issue authors.
+#  - One run at a time per issue/PR (job-level concurrency). `agent:working` is a visible indicator.
+
+name: "AI-SDLC Pipeline"
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [closed]
+
+jobs:
+  pm:
+    if: >-
+      (github.event_name == 'issues' &&
+        github.event.label.name == 'status:new-feature' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
+      (github.event_name == 'issue_comment' && !github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/refine') &&
+        contains(github.event.issue.labels.*.name, 'gate:pm-review') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    concurrency:
+      group: ai-sdlc-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    uses: s-fletcher27/ai-sdlc/.github/workflows/reusable-01-pm.yml@main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  architect:
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'status:pm-approved') ||
+      (github.event_name == 'issue_comment' && !github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/refine') &&
+        contains(github.event.issue.labels.*.name, 'gate:design-review') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    concurrency:
+      group: ai-sdlc-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+    uses: s-fletcher27/ai-sdlc/.github/workflows/reusable-02-architect.yml@main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+  developer:
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'status:design-approved') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/refine') &&
+        contains(github.event.issue.labels.*.name, 'gate:pr-review') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged &&
+        startsWith(github.event.pull_request.head.ref, 'feat/issue-'))
+    concurrency:
+      group: ai-sdlc-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: s-fletcher27/ai-sdlc/.github/workflows/reusable-03-developer.yml@main
+    with:
+      container_image: "python:3.12-slim"
+      setup_command: "pip install --quiet -e '.[dev]'"
+      test_command: "pytest -q"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

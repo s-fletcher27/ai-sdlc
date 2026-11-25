@@ -1,0 +1,142 @@
+name: "AI-SDLC 02 · Architect design"
+
+# Called from a target repo on:
+#   - issues.labeled with `status:pm-approved`                (initial run)
+#   - issue_comment `/refine ...` while `gate:design-review`   (refine run)
+# Writes docs/designs/issue-<N>.md on branch ai/issue-<N> (never on the default branch).
+
+on:
+  workflow_call:
+    inputs:
+      max_turns:
+        type: number
+        default: 20
+      ai_sdlc_repo:
+        type: string
+        default: "s-fletcher27/ai-sdlc"
+      ai_sdlc_ref:
+        type: string
+        default: "main"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  architect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      EVENT_NAME: ${{ github.event_name }}
+      MODE: ${{ github.event_name == 'issue_comment' && 'refine' || 'initial' }}
+      BRANCH: ai/issue-${{ github.event.issue.number }}
+      DESIGN_PATH: docs/designs/issue-${{ github.event.issue.number }}.md
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Lock issue and consume Gate 1 labels
+        run: |
+          gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --add-label "agent:working"
+          if [ "$EVENT_NAME" = "issues" ]; then
+            gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "status:pm-approved" || true
+            gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "gate:pm-review" || true
+          fi
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout ai-sdlc framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ai_sdlc_repo }}
+          ref: ${{ inputs.ai_sdlc_ref }}
+          path: .ai-sdlc-framework
+
+      - name: Switch to design branch
+        run: |
+          mv .ai-sdlc-framework "$RUNNER_TEMP/ai-sdlc"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+      - name: Build prompt
+        env:
+          REFINE_FEEDBACK: ${{ github.event.comment.body }}
+        run: |
+          mkdir -p .ai-sdlc-out
+          echo ".ai-sdlc-out/" >> .git/info/exclude
+          bash "$RUNNER_TEMP/ai-sdlc/scripts/context.sh" "$ISSUE_NUMBER" > .ai-sdlc-out/context.md
+          bash "$RUNNER_TEMP/ai-sdlc/scripts/render-prompt.sh" \
+            "$RUNNER_TEMP/ai-sdlc/prompts/architect.md" .ai-sdlc-out/context.md > .ai-sdlc-out/prompt.md
+
+      - name: Install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run Architect agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+        run: |
+          claude -p --max-turns "$MAX_TURNS" --allowedTools "Read,Glob,Grep,Write,Edit" \
+            < .ai-sdlc-out/prompt.md || echo "::warning::claude exited non-zero (possibly max turns reached)"
+          if [ ! -s "$DESIGN_PATH" ]; then
+            echo "::error::Architect agent did not write $DESIGN_PATH"; exit 1
+          fi
+          if ! grep -Eq '^### Story 1([:. ]|$)' "$DESIGN_PATH"; then
+            echo "::error::$DESIGN_PATH has no '### Story 1' section; the Developer stage needs per-story sections"; exit 1
+          fi
+
+      - name: Commit and push design (design doc only)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          stray="$(git status --porcelain -uall | grep -v " $DESIGN_PATH\$" || true)"
+          [ -n "$stray" ] && echo "::warning::Ignoring non-design changes made by the agent:" && echo "$stray"
+          git add "$DESIGN_PATH"
+          if git diff --cached --quiet; then
+            echo "Design unchanged; nothing to commit."
+          else
+            git commit -m "docs(design): technical design for #$ISSUE_NUMBER ($MODE)"
+            git push origin "HEAD:$BRANCH"
+          fi
+
+      - name: Post design and open Gate 2
+        run: |
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$BRANCH/$DESIGN_PATH"
+          {
+            echo "## 🏗️ Technical Design ($MODE)"
+            echo
+            echo "Design committed to [\`$DESIGN_PATH\`]($url) on branch \`$BRANCH\`."
+            echo
+            echo "<details><summary>View design</summary>"
+            echo
+            cat "$DESIGN_PATH"
+            echo
+            echo "</details>"
+            echo
+            echo "---"
+            echo "*Status: Ready for Human Gate 2. Comment \`/refine <feedback>\` to adjust, or apply the \`status:design-approved\` label to start building Story 1.*"
+          } > .ai-sdlc-out/comment.md
+          gh issue comment "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --body-file .ai-sdlc-out/comment.md
+          gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --add-label "gate:design-review"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          # shellcheck disable=SC2016  # backticks are literal Markdown
+          if [ "$MODE" = "refine" ]; then retry='comment `/refine ...` again'; else retry='re-apply the `status:pm-approved` label'; fi
+          gh issue comment "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" \
+            --body "⚠️ Architect agent run failed ([logs]($RUN_URL)). To retry, $retry."
+
+      - name: Unlock issue
+        if: always()
+        run: gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "agent:working" || true

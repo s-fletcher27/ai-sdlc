@@ -1,0 +1,99 @@
+name: "AI-SDLC 01 · PM breakdown"
+
+# Called from a target repo on:
+#   - issues.labeled with `status:new-feature`             (initial run)
+#   - issue_comment `/refine ...` while `gate:pm-review`    (refine run)
+# Routing/authorisation lives in the caller (see examples/ai-sdlc.yml).
+
+on:
+  workflow_call:
+    inputs:
+      max_turns:
+        type: number
+        default: 10
+      ai_sdlc_repo:
+        description: "Repo holding prompts/ and scripts/ (this framework)"
+        type: string
+        default: "s-fletcher27/ai-sdlc"
+      ai_sdlc_ref:
+        type: string
+        default: "main"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  pm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      EVENT_NAME: ${{ github.event_name }}
+      MODE: ${{ github.event_name == 'issue_comment' && 'refine' || 'initial' }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Lock issue and consume trigger label
+        run: |
+          gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --add-label "agent:working"
+          if [ "$EVENT_NAME" = "issues" ]; then
+            gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "status:new-feature" || true
+          fi
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+
+      - name: Checkout ai-sdlc framework
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ai_sdlc_repo }}
+          ref: ${{ inputs.ai_sdlc_ref }}
+          path: .ai-sdlc-framework
+
+      - name: Build prompt
+        env:
+          REFINE_FEEDBACK: ${{ github.event.comment.body }}
+        run: |
+          mv .ai-sdlc-framework "$RUNNER_TEMP/ai-sdlc"
+          mkdir -p .ai-sdlc-out
+          echo ".ai-sdlc-out/" >> .git/info/exclude
+          bash "$RUNNER_TEMP/ai-sdlc/scripts/context.sh" "$ISSUE_NUMBER" > .ai-sdlc-out/context.md
+          bash "$RUNNER_TEMP/ai-sdlc/scripts/render-prompt.sh" \
+            "$RUNNER_TEMP/ai-sdlc/prompts/pm.md" .ai-sdlc-out/context.md > .ai-sdlc-out/prompt.md
+
+      - name: Install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run PM agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAX_TURNS: ${{ inputs.max_turns }}
+        run: |
+          claude -p --max-turns "$MAX_TURNS" --allowedTools "Read,Glob,Grep,Write" \
+            < .ai-sdlc-out/prompt.md || echo "::warning::claude exited non-zero (possibly max turns reached)"
+          if [ ! -s .ai-sdlc-out/pm_output.md ]; then
+            echo "::error::PM agent did not write .ai-sdlc-out/pm_output.md"
+            exit 1
+          fi
+
+      - name: Post breakdown and open Gate 1
+        run: |
+          gh issue comment "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --body-file .ai-sdlc-out/pm_output.md
+          gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --add-label "gate:pm-review"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          # shellcheck disable=SC2016  # backticks are literal Markdown
+          if [ "$MODE" = "refine" ]; then retry='comment `/refine ...` again'; else retry='re-apply the `status:new-feature` label'; fi
+          gh issue comment "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" \
+            --body "⚠️ PM agent run failed ([logs]($RUN_URL)). To retry, $retry."
+
+      - name: Unlock issue
+        if: always()
+        run: gh issue edit "$ISSUE_NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "agent:working" || true
